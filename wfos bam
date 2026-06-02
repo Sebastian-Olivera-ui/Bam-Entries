@@ -1,0 +1,159 @@
+$ErrorActionPreference = 'SilentlyContinue'
+
+function Get-Signature {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory, ValueFromPipeline, ValueFromPipelineByPropertyName)]
+        [string[]]$FilePath
+    )
+
+    process {
+        foreach ($path in $FilePath) {
+            if (-not (Test-Path -Path $path -PathType Leaf)) {
+                [PSCustomObject]@{
+                    FilePath  = $path
+                    Signature = 'El archivo no fue encontrado'
+                }
+                continue
+            }
+
+            $status = (Get-AuthenticodeSignature -FilePath $path -ErrorAction SilentlyContinue).Status
+            $signatureText = switch ($status) {
+                'Valid'       { 'Firma Valida' }
+                'NotSigned'   { 'Firma Invalida (No esta firmado)' }
+                'HashMismatch' { 'Firma Invalida (HashMismatch)' }
+                'NotTrusted'  { 'Firma Invalida (NotTrusted)' }
+                'UnknownError' { 'Firma Invalida (UnknownError)' }
+                default       { 'Firma Invalida (UnknownError)' }
+            }
+
+            [PSCustomObject]@{
+                FilePath  = $path
+                Signature = $signatureText
+            }
+        }
+    }
+}
+
+Clear-Host
+
+Write-Host -ForegroundColor Red " 
+██╗    ██╗  ███████╗  ██████╗  ███████╗
+██║    ██║  ██╔════╝ ██╔══██╗ ██╔════╝
+██║ █╗ ██║  █████╗   ██║  ██║  █████╗
+██║███╗██║  ██╔══╝   ██║  ██║  ╚══███╗
+╚███╔███╔╝  ██║      ╚█████╔╝ ███████║
+ ╚══╝╚══╝   ╚═╝       ╚════╝   ╚═════╝"
+Write-Host ''
+Write-Host -ForegroundColor Green ' viva peru '
+Write-Host ''
+
+function Test-Admin {
+    $currentUser = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+    return $currentUser.IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
+}
+
+if (-not (Test-Admin)) {
+    Write-Warning 'Brother ejecutalo como ADMIN :V'
+    Start-Sleep 10
+    Exit
+}
+
+$sw = [Diagnostics.Stopwatch]::StartNew()
+
+if (-not (Get-PSDrive -Name HKLM -PSProvider Registry)) {
+    try {
+        New-PSDrive -Name HKLM -PSProvider Registry -Root HKEY_LOCAL_MACHINE
+    } catch {
+        Write-Warning 'Error montando HKEY_Local_Machine'
+    }
+}
+
+$services = @('bam', 'bam\State')
+try {
+    $Users = foreach ($service in $services) {
+        Get-ChildItem -Path "HKLM:\SYSTEM\CurrentControlSet\Services\$service\UserSettings\" | Select-Object -ExpandProperty PSChildName
+    }
+} catch {
+    Write-Warning 'Error Parseando BAM Key. Probablemente no soporta tu version de Windows :('
+    Exit
+}
+
+$rpath = @('HKLM:\SYSTEM\CurrentControlSet\Services\bam\', 'HKLM:\SYSTEM\CurrentControlSet\Services\bam\state\')
+
+$tzInfo = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\TimeZoneInformation'
+$UserTime = $tzInfo.TimeZoneKeyName
+$UserBias = $tzInfo.ActiveTimeBias
+$UserDay = $tzInfo.DaylightBias
+
+$Bam = foreach ($Sid in $Users) {
+    foreach ($rp in $rpath) {
+        $regPath = "$rp`UserSettings\$Sid"
+        $BamItems = Get-Item -Path $regPath -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Property
+
+        Write-Host -ForegroundColor Green 'Extrayendo ' -NoNewLine
+        Write-Host -ForegroundColor Blue $regPath
+
+        try {
+            $objSID = New-Object System.Security.Principal.SecurityIdentifier($Sid)
+            $User = $objSID.Translate([System.Security.Principal.NTAccount]).Value
+        } catch {
+            $User = ''
+        }
+
+        if (-not $BamItems) { continue }
+
+        foreach ($Item in $BamItems) {
+            $Key = Get-ItemProperty -Path $regPath -ErrorAction SilentlyContinue | Select-Object -ExpandProperty $Item
+            if ($Key -and $Key.Length -eq 24) {
+                $Hex = [System.BitConverter]::ToString($Key[7..0]) -replace '-', ''
+                $fileTime = [Convert]::ToInt64($Hex, 16)
+                $TimeLocal = Get-Date ([DateTime]::FromFileTime($fileTime)) -Format 'yyyy-MM-dd HH:mm:ss'
+                $TimeUTC = Get-Date ([DateTime]::FromFileTimeUtc($fileTime)) -Format 'yyyy-MM-dd HH:mm:ss'
+                $Bias = -([Convert]::ToInt32([Convert]::ToString($UserBias, 2), 2))
+                $Day = -([Convert]::ToInt32([Convert]::ToString($UserDay, 2), 2))
+                $TimeUser = Get-Date ([DateTime]::FromFileTimeUtc($fileTime)).AddMinutes($Bias) -Format 'yyyy-MM-dd HH:mm:ss'
+
+                $isDevicePath = ((Split-Path -Path $Item -Parent) -match '\\Device\\HarddiskVolume\d+')
+                if ($isDevicePath) {
+                    $cleanPath = $Item.TrimStart('\')
+                    $f = Split-Path -Leaf $cleanPath
+                    $cp = $Item.Substring(24)
+                    $path = Join-Path -Path 'C:' -ChildPath $cp
+                } else {
+                    $f = $Item
+                    $cp = ''
+                    $path = ''
+                }
+
+                $sig = if ($path) {
+                    (Get-Signature -FilePath $path).Signature
+                } else {
+                    ''
+                }
+
+                [PSCustomObject]@{
+                    'Tiempo del examinador'                    = $TimeLocal
+                    'Tiempo de ultima ejecucion (UTC)'          = $TimeUTC
+                    'Tiempo de ultima ejecucion (Hora del usuario)' = $TimeUser
+                    Application                                = $f
+                    Path                                       = $path
+                    Signature                                  = $sig
+                    User                                       = $User
+                    SID                                        = $Sid
+                    Regpath                                    = $rp
+                }
+            }
+        }
+    }
+}
+
+$BiasText = if ($Bias) { $Bias } else { 0 }
+$DayText = if ($Day) { $Day } else { 0 }
+
+$Bam | Out-GridView -PassThru -Title "Entradas BAM: $($Bam.Count)  - Zona Horaria del Usuario: ($UserTime) -> ActiveBias: ($BiasText) - DayLightTime: ($DayText)"
+
+$sw.Stop()
+$t = [math]::Round($sw.Elapsed.TotalMinutes, 2)
+Write-Host ''
+Write-Host "Se tardo $t Minutos" -ForegroundColor Yellow
